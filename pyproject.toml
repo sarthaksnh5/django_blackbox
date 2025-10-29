@@ -10,7 +10,7 @@ readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
 authors = [
-    { name = "Django Black Box Contributors" }
+    { name = "Sarthak Lamba", email = "sarthaksnh5@gmail.com" }
 ]
 keywords = ["django", "error-tracking", "monitoring", "logging", "incidents", "blackbox"]
 classifiers = [

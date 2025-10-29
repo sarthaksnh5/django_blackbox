@@ -23,9 +23,8 @@ class IncidentViewSet(viewsets.ReadOnlyModelViewSet):
     """
     
     queryset = Incident.objects.all()
-    serializer_class = IncidentSerializer
-    permission_classes = [AllowAny]
-    # permission_classes = DEFAULT_PERMISSION_CLASS
+    serializer_class = IncidentSerializer    
+    permission_classes = DEFAULT_PERMISSION_CLASS
     lookup_field = "request_id"  # Use incident_id instead of pk for lookups
 
     @action(detail=True, methods=["get"])
