@@ -61,13 +61,21 @@ class Config:
     RETURN_400_INSTEAD_OF_500: bool = False
     CUSTOM_ERROR_FORMAT: dict | None = None
     OVERRIDE_500_TEMPLATE: str | None = None
+    # Activity logging settings
+    ACTIVITY_LOG_ENABLED: bool = True
+    ACTIVITY_LOG_SAMPLE_RATE: float = 1.0  # 0.0-1.0
+    ACTIVITY_LOG_IGNORE_PATHS: list[str] = field(default_factory=lambda: [])
+    STORE_RESPONSE_BODY: bool = True  # Default to True to log response bodies
+    MAX_RESPONSE_BODY_BYTES: int = 1024
     _compiled_ignore_paths: list[Any] = field(default_factory=list, init=False, repr=False)
     _compiled_ignore_exceptions: list[Any] = field(default_factory=list, init=False, repr=False)
+    _compiled_activity_ignore_paths: list[Any] = field(default_factory=list, init=False, repr=False)
 
     def __post_init__(self):
         """Compile regex patterns for ignore paths."""
         self._compiled_ignore_paths = [re.compile(p) for p in self.IGNORE_PATHS]
         self._compiled_ignore_exceptions = self.IGNORE_EXCEPTIONS
+        self._compiled_activity_ignore_paths = [re.compile(p) for p in self.ACTIVITY_LOG_IGNORE_PATHS]
 
 
 _config: Config | None = None
@@ -129,6 +137,11 @@ def _reload_config():
         "RETURN_400_INSTEAD_OF_500": False,
         "CUSTOM_ERROR_FORMAT": None,
         "OVERRIDE_500_TEMPLATE": None,
+        "ACTIVITY_LOG_ENABLED": True,
+        "ACTIVITY_LOG_SAMPLE_RATE": 1.0,
+        "ACTIVITY_LOG_IGNORE_PATHS": [],
+        "STORE_RESPONSE_BODY": True,  # Default to True to log response bodies
+        "MAX_RESPONSE_BODY_BYTES": 1024,
     }
     
     config_dict = {**defaults, **user_settings}

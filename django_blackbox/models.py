@@ -4,6 +4,9 @@ Data models for server incidents.
 import uuid
 from datetime import timedelta
 
+from django.conf import settings
+from django.contrib.contenttypes.fields import GenericForeignKey
+from django.contrib.contenttypes.models import ContentType
 from django.db import models, transaction
 from django.utils import timezone
 
@@ -198,4 +201,99 @@ class Incident(models.Model):
             # Clear resolved_at if status changes away from RESOLVED
             self.resolved_at = None
         super().save(*args, **kwargs)
+
+
+class RequestActivity(models.Model):
+    """
+    Model to track all HTTP request/response activity with rich metadata.
+    
+    Captures 2xx, 3xx, 4xx, and 5xx responses. Can optionally track
+    instance state changes for mutating operations (POST/PUT/PATCH/DELETE).
+    """
+
+    id = models.BigAutoField(primary_key=True)
+    
+    # Core metadata
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
+    method = models.CharField(max_length=10)
+    path = models.TextField()
+    full_path = models.TextField(blank=True)  # path + querystring
+    http_status = models.IntegerField()
+    response_time_ms = models.FloatField(null=True, blank=True)
+    
+    # View/route resolution
+    view_name = models.CharField(max_length=255, blank=True)
+    route_name = models.CharField(max_length=255, blank=True)
+    
+    # Request IDs / Correlation
+    request_id = models.CharField(max_length=64, blank=True, db_index=True)
+    incident = models.ForeignKey(
+        "django_blackbox.Incident",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="activities",
+    )
+    
+    # User context
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="request_activities",
+    )
+    is_authenticated = models.BooleanField(default=False)
+    
+    # Client info
+    ip_address = models.GenericIPAddressField(null=True, blank=True)
+    user_agent = models.TextField(blank=True)
+    
+    # Related object (Generic FK for detail views)
+    content_type = models.ForeignKey(
+        ContentType,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="request_activities",
+    )
+    object_id = models.CharField(max_length=255, blank=True)
+    related_object = GenericForeignKey("content_type", "object_id")
+    
+    # Request & response data (JSON/text; redacted/truncated as per settings)
+    request_headers = models.JSONField(default=dict, blank=True)
+    request_body = models.TextField(blank=True)
+    response_headers = models.JSONField(default=dict, blank=True)
+    response_body = models.TextField(blank=True)
+    
+    # Instance state change tracking for POST/PUT/PATCH/DELETE
+    # High-level action label, e.g. "create", "update", "delete", "custom"
+    action = models.CharField(max_length=64, blank=True)
+    
+    # JSON snapshots of instance state BEFORE and AFTER the operation
+    # (e.g. serializer data or model_to_dict output)
+    instance_before = models.JSONField(default=dict, blank=True)
+    instance_after = models.JSONField(default=dict, blank=True)
+    
+    # Optional computed diff between before/after (field -> [old, new])
+    instance_diff = models.JSONField(default=dict, blank=True)
+    
+    # Custom action and payload for developer-defined activities
+    custom_action = models.CharField(max_length=128, blank=True)
+    custom_payload = models.JSONField(default=dict, blank=True)
+    
+    # Any extra metadata (e.g. tags, feature flags, etc.)
+    extra = models.JSONField(default=dict, blank=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["created_at"]),
+            models.Index(fields=["http_status"]),
+            models.Index(fields=["method", "path"]),
+            models.Index(fields=["user", "created_at"]),
+        ]
+
+    def __str__(self):
+        return f"{self.method} {self.path} [{self.http_status}] ({self.request_id})"
 

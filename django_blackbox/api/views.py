@@ -8,9 +8,9 @@ from rest_framework.decorators import action
 from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
 
-from django_blackbox.models import Incident
+from django_blackbox.models import Incident, RequestActivity
 from .permissions import DEFAULT_PERMISSION_CLASS
-from .serializers import IncidentSerializer
+from .serializers import IncidentSerializer, RequestActivitySerializer
 
 
 class IncidentViewSet(viewsets.ReadOnlyModelViewSet):
@@ -142,3 +142,44 @@ class IncidentViewSet(viewsets.ReadOnlyModelViewSet):
             "headers_count": len(incident.headers) if incident.headers else 0,
             "has_body": bool(incident.body_preview and incident.method.upper() in body_methods),
         })
+
+
+class RequestActivityViewSet(viewsets.ReadOnlyModelViewSet):
+    """
+    Read-only ViewSet for RequestActivity model.
+    
+    Provides:
+    - GET /api/activities/               - List all activities
+    - GET /api/activities/{id}/          - Retrieve a specific activity
+    """
+    
+    queryset = RequestActivity.objects.all()
+    serializer_class = RequestActivitySerializer
+    permission_classes = DEFAULT_PERMISSION_CLASS
+    filterset_fields = [
+        "method",
+        "http_status",
+        "user",
+        "action",
+        "custom_action",
+        "request_id",
+        "is_authenticated",
+    ]
+    ordering_fields = [
+        "created_at",
+        "http_status",
+        "response_time_ms",
+        "method",
+        "path",
+    ]
+    ordering = ["-created_at"]
+    search_fields = [
+        "path",
+        "request_id",
+        "user__username",
+        "user__email",
+        "ip_address",
+        "custom_action",
+        "view_name",
+        "route_name",
+    ]

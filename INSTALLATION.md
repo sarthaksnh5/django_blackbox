@@ -89,8 +89,9 @@ MIDDLEWARE = [
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.common.CommonMiddleware',
     
-    # Add these two lines near the top
+    # Add these three lines near the top
     'django_blackbox.middleware.RequestIDMiddleware',
+    'django_blackbox.middleware.ActivityLoggingMiddleware',  # Log all requests (optional)
     'django_blackbox.middleware.Capture5xxMiddleware',
     
     'django.middleware.csrf.CsrfViewMiddleware',

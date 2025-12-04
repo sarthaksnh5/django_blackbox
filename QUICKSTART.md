@@ -23,11 +23,14 @@ Add middleware:
 
 ```python
 MIDDLEWARE = [
-    'server_incidents.middleware.RequestIDMiddleware',
-    'server_incidents.middleware.Capture5xxMiddleware',
+    'django_blackbox.middleware.RequestIDMiddleware',
+    'django_blackbox.middleware.ActivityLoggingMiddleware',  # Optional: log all requests
+    'django_blackbox.middleware.Capture5xxMiddleware',
     # ... rest of middleware
 ]
 ```
+
+> **Note:** `ActivityLoggingMiddleware` is optional but recommended. It logs all HTTP requests/responses (not just errors) for comprehensive audit trails.
 
 ## 3. Run migrations
 
@@ -68,6 +71,8 @@ Go to `/admin/django_blackbox/incident/` to see all incidents.
 ## Done!
 
 That's it. Every 5xx error now has a traceable Incident ID. Your users can share this with support, and you can track patterns in Django admin.
+
+If you added `ActivityLoggingMiddleware`, all HTTP requests are also logged to the `RequestActivity` model, available at `/admin/django_blackbox/requestactivity/`.
 
 ## Next Steps
 

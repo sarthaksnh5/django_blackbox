@@ -3,7 +3,7 @@ Serializers for the read-only API.
 """
 from rest_framework import serializers
 
-from django_blackbox.models import Incident
+from django_blackbox.models import Incident, RequestActivity
 
 
 class IncidentSerializer(serializers.ModelSerializer):
@@ -45,4 +45,61 @@ class IncidentSerializer(serializers.ModelSerializer):
         ]
         read_only_fields = fields
         # Note: stacktrace excluded by default for size, can be added if needed
+
+
+class RequestActivitySerializer(serializers.ModelSerializer):
+    """Serializer for RequestActivity model (read-only)."""
+
+    formatted_created_at = serializers.DateTimeField(
+        source="created_at",
+        read_only=True,
+        format="%Y-%m-%d %H:%M:%S %Z",
+    )
+    user_username = serializers.CharField(source="user.username", read_only=True)
+    user_email = serializers.CharField(source="user.email", read_only=True)
+    related_object_repr = serializers.SerializerMethodField()
+
+    class Meta:
+        model = RequestActivity
+        fields = [
+            "id",
+            "created_at",
+            "formatted_created_at",
+            "method",
+            "path",
+            "full_path",
+            "http_status",
+            "response_time_ms",
+            "view_name",
+            "route_name",
+            "request_id",
+            "incident",
+            "user",
+            "user_username",
+            "user_email",
+            "is_authenticated",
+            "ip_address",
+            "user_agent",
+            "content_type",
+            "object_id",
+            "related_object_repr",
+            "request_headers",
+            "request_body",
+            "response_headers",
+            "response_body",
+            "action",
+            "instance_before",
+            "instance_after",
+            "instance_diff",
+            "custom_action",
+            "custom_payload",
+            "extra",
+        ]
+        read_only_fields = fields
+
+    def get_related_object_repr(self, obj):
+        """Get string representation of related object."""
+        if obj.related_object:
+            return str(obj.related_object)
+        return None
 

@@ -19,6 +19,9 @@ A reusable, production-ready Django app that **captures and tracks HTTP errors**
 - ✅ **DRF integration** – Seamless integration with Django REST Framework
 - ✅ **Fallback logging** – Writes to file if database save fails
 - ✅ **Retention management** – Command to prune old incidents
+- ✅ **Request Activity Logging** – Log all HTTP requests/responses (2xx, 3xx, 4xx, 5xx) with rich metadata
+- ✅ **Instance Change Tracking** – Track before/after state for mutating operations (POST/PUT/PATCH/DELETE)
+- ✅ **Custom Activity Labels** – Attach custom actions and payloads to request activities
 
 ## Installation
 
@@ -69,10 +72,13 @@ Add the middleware **near the top** of your `MIDDLEWARE` setting (before other e
 ```python
 MIDDLEWARE = [
     "django_blackbox.middleware.RequestIDMiddleware",
+    "django_blackbox.middleware.ActivityLoggingMiddleware",  # Log all requests
     "django_blackbox.middleware.Capture5xxMiddleware",
     # ... your other middleware
 ]
 ```
+
+> **Note:** `ActivityLoggingMiddleware` should be placed **after** `RequestIDMiddleware` but **before** `Capture5xxMiddleware`.
 
 ### 3. For Django REST Framework Projects
 
@@ -86,7 +92,7 @@ REST_FRAMEWORK = {
 
 ### 4. Database Migrations
 
-Run migrations to create the Incident model:
+Run migrations to create the Incident and RequestActivity models:
 
 ```bash
 python manage.py makemigrations django_blackbox
@@ -117,6 +123,13 @@ DJANGO_BLACKBOX = {
         "status": 500,
         "error_message": "Server faced some internal error, please ask support team with this incident id: <incident_id>"
     },
+    # Activity logging settings
+    "ACTIVITY_LOG_ENABLED": True,
+    "ACTIVITY_LOG_SAMPLE_RATE": 1.0,  # 0.0-1.0
+    "ACTIVITY_LOG_IGNORE_PATHS": [r"^/health/", r"^/metrics"],
+    "STORE_RESPONSE_BODY": False,  # Set True to capture response bodies
+    "MAX_RESPONSE_BODY_BYTES": 1024,
+    
     # ... see Configuration for full list
 }
 ```
@@ -355,6 +368,137 @@ from django_blackbox.models import Incident
 # Customize fields, list_display, etc.
 ```
 
+## Request Activity Logging
+
+The `ActivityLoggingMiddleware` logs **every HTTP request/response** (2xx, 3xx, 4xx, and 5xx) to the `RequestActivity` model, providing comprehensive audit trails and debugging capabilities.
+
+### Features
+
+- **All Status Codes** – Captures 2xx, 3xx, 4xx, and 5xx responses
+- **Rich Metadata** – Request/response headers, bodies, user info, IP, user agent, response time
+- **View Resolution** – Automatically captures view name and route name
+- **Related Objects** – Links to model instances via GenericForeignKey
+- **Incident Linking** – Automatically links to `Incident` objects when 5xx errors occur
+- **Sampling & Filtering** – Configurable sample rates and path ignore patterns
+
+### Configuration
+
+```python
+DJANGO_BLACKBOX = {
+    # Enable/disable activity logging
+    "ACTIVITY_LOG_ENABLED": True,
+    
+    # Sample rate (0.0-1.0) for high-traffic sites
+    "ACTIVITY_LOG_SAMPLE_RATE": 1.0,
+    
+    # Paths to ignore (regex patterns)
+    "ACTIVITY_LOG_IGNORE_PATHS": [
+        r"^/health/",
+        r"^/metrics",
+        r"^/static/",
+    ],
+    
+    # Response body logging (optional, disabled by default)
+    "STORE_RESPONSE_BODY": False,
+    "MAX_RESPONSE_BODY_BYTES": 1024,
+}
+```
+
+### Instance Change Tracking
+
+For mutating operations (POST/PUT/PATCH/DELETE), you can track the **before** and **after** state of model instances.
+
+#### Using the Helper Function
+
+```python
+from django_blackbox.activity import set_request_activity_change
+
+def update_user(request, user_id):
+    user = User.objects.get(id=user_id)
+    instance_before = model_to_dict(user)  # Or use serializer
+    
+    # Perform update
+    user.name = "New Name"
+    user.save()
+    
+    instance_after = model_to_dict(user)
+    
+    # Attach change context to request
+    set_request_activity_change(
+        request,
+        instance_before=instance_before,
+        instance_after=instance_after,
+        action="update",
+        custom_action="user_profile_updated",
+        custom_payload={"changed_by": request.user.id},
+    )
+    
+    return JsonResponse({"status": "ok"})
+```
+
+#### Using the Decorator (DRF ViewSets)
+
+```python
+from rest_framework import viewsets
+from django_blackbox.activity import log_request_activity_change
+
+class UserViewSet(viewsets.ModelViewSet):
+    queryset = User.objects.all()
+    serializer_class = UserSerializer
+    
+    @log_request_activity_change(
+        action="update",
+        custom_action="user_profile_updated"
+    )
+    def update(self, request, *args, **kwargs):
+        # The decorator automatically captures:
+        # - instance_before: from self.get_object()
+        # - instance_after: from serializer.instance
+        return super().update(request, *args, **kwargs)
+    
+    @log_request_activity_change(
+        action="create",
+        custom_action="user_created"
+    )
+    def create(self, request, *args, **kwargs):
+        return super().create(request, *args, **kwargs)
+    
+    @log_request_activity_change(
+        action="delete",
+        custom_action="user_deleted"
+    )
+    def destroy(self, request, *args, **kwargs):
+        return super().destroy(request, *args, **kwargs)
+```
+
+The decorator automatically:
+- Captures `instance_before` by calling `self.get_object()` before the operation
+- Captures `instance_after` from `serializer.instance` after the operation
+- Computes a diff between before/after states
+- Stores everything in the `RequestActivity` record
+
+#### Manual Instance Tracking
+
+You can also manually set attributes on the view or request:
+
+```python
+@log_request_activity_change(
+    action="update",
+    instance_before_attr="_instance_before",  # Attribute on view/request
+    instance_after_attr="_instance_after",
+    extra_payload_callable=lambda req, resp: {"custom": "data"},
+)
+def update(self, request, *args, **kwargs):
+    self._instance_before = self.get_object()
+    result = super().update(request, *args, **kwargs)
+    self._instance_after = self.get_object()
+    return result
+```
+
+### Viewing Activities
+
+Activities are available in Django admin at `/admin/django_blackbox/requestactivity/` and via the read-only API at `/api/activities/`.
+
 ## Optional Read-Only API
 
 Mount the API under your URLconf for programmatic access:
@@ -372,8 +516,26 @@ urlpatterns = [
 
 - `GET /api/incidents/` – List all incidents
 - `GET /api/incidents/<incident_id>/` – Retrieve a single incident
+- `GET /api/activities/` – List all request activities
+- `GET /api/activities/<id>/` – Retrieve a single activity
 
 The API uses DRF's `ReadOnlyModelViewSet`, providing automatic pagination, filtering, and search capabilities.
+
+### Filtering Activities
+
+The activities endpoint supports filtering by:
+- `method` – HTTP method (GET, POST, etc.)
+- `http_status` – Status code
+- `user` – User ID
+- `action` – Action label (create, update, delete)
+- `custom_action` – Custom action label
+- `request_id` – Request ID
+- `is_authenticated` – Boolean
+
+Example:
+```
+GET /api/activities/?method=POST&http_status=200&action=update
+```
 
 ### Permissions
 
@@ -618,6 +780,18 @@ DJANGO_BLACKBOX = {
 
 **Q: Can I store authorization tokens in original format?**  
 A: Yes, set `REDACT_SENSITIVE_DATA: False` in settings. Use this only in secure environments with proper access controls.
+
+**Q: What is Request Activity Logging?**  
+A: A feature that logs **every HTTP request/response** (not just errors) to the `RequestActivity` model. Useful for audit trails, debugging, and analytics.
+
+**Q: Does activity logging capture all requests?**  
+A: Yes, by default it captures all requests (2xx, 3xx, 4xx, 5xx). You can configure sampling rates and ignore paths to reduce volume.
+
+**Q: How do I track instance changes?**  
+A: Use `set_request_activity_change()` helper or the `@log_request_activity_change` decorator. See the "Instance Change Tracking" section above.
+
+**Q: Can I disable activity logging?**  
+A: Yes, set `ACTIVITY_LOG_ENABLED: False` in your `DJANGO_BLACKBOX` settings.
 
 ## Development
 
