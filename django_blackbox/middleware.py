@@ -262,7 +262,7 @@ class ActivityLoggingMiddleware(MiddlewareMixin):
         # 2. Collect parsed body data (DRF request.data or request.POST)
         body_data = None
         
-        # Try DRF request.data first        
+        # Try DRF request.data first                
         if hasattr(request, "data"):            
             try:
                 data_attr = request.data
@@ -271,22 +271,7 @@ class ActivityLoggingMiddleware(MiddlewareMixin):
                 if data_attr is not None:
                     body_data = data_attr
             except Exception as e:                
-                pass
-
-        if hasattr(request, 'body'):
-            try:
-                data_attr = request.body.decode("utf-8")
-
-                if data_attr is not None:
-                    try:
-                        data_attr = json.loads(data_attr)
-                    except Exception as e:
-                        pass
-                    
-                    body_data = data_attr
-
-            except Exception as e:                
-                pass
+                pass        
         
         # Fallback to request.POST if no DRF data
         if body_data is None:            
