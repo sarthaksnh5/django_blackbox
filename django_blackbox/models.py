@@ -297,3 +297,11 @@ class RequestActivity(models.Model):
     def __str__(self):
         return f"{self.method} {self.path} [{self.http_status}] ({self.request_id})"
 
+
+# Explicit exports for public API
+__all__ = [
+    "Incident",
+    "RequestActivity",
+    "IncidentManager",
+]
+

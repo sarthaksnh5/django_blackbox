@@ -21,7 +21,63 @@ from django_blackbox.utils import (
     redact_body,
     redact_headers,
     safe_log_to_file,
+    sanitize_for_json,
 )
+
+
+class BodyCaptureMiddleware(MiddlewareMixin):
+    """
+    Middleware that safely caches the raw request body once, at the very beginning
+    of the request lifecycle, so that later middlewares (like ActivityLoggingMiddleware)
+    can use it without triggering RawPostDataException.
+    
+    NOTE: This middleware MUST be placed near the top of MIDDLEWARE, before DRF,
+    CSRF, and any middleware that may read request.POST or request.body.
+    
+    Correct MIDDLEWARE order:
+        MIDDLEWARE = [
+            # ... security, sessions, etc. ...
+            "django_blackbox.middleware.BodyCaptureMiddleware",       # <== Early, before DRF/CSRF
+            "django_blackbox.middleware.RequestIDMiddleware",
+            "django_blackbox.middleware.ActivityLoggingMiddleware",
+            "django_blackbox.middleware.Capture5xxMiddleware",
+            # ... DRF, authentication, etc. ...
+        ]
+    """
+
+    def __init__(self, get_response):
+        """Initialize middleware."""
+        self.get_response = get_response
+        super().__init__(get_response)
+
+    def __call__(self, request):
+        """
+        Cache the raw request body for mutating methods.
+        
+        This reads request.body once at the very beginning, which:
+        - Populates Django's internal _body cache
+        - Allows DRF/CSRF to read it later without issues
+        - Stores a copy in request._django_blackbox_raw_body for our logging
+        """
+        # Only cache for mutating methods; safe no-op for others
+        raw_body = None
+        try:
+            if request.method.upper() in ("POST", "PUT", "PATCH", "DELETE"):
+                # Accessing request.body here populates request._body and caches the stream.
+                # Django will then reuse this cached body for request.POST / DRF parsing.
+                raw_body = request.body
+        except RawPostDataException:
+            # Body was already read by an even earlier middleware; cannot recover
+            raw_body = None
+        except Exception:
+            # Any other error; safe to ignore
+            raw_body = None
+        
+        # Store cached raw body for downstream use
+        request._django_blackbox_raw_body = raw_body
+        
+        response = self.get_response(request)
+        return response
 
 
 class RequestIDMiddleware(MiddlewareMixin):
@@ -162,6 +218,8 @@ class ActivityLoggingMiddleware(MiddlewareMixin):
 
     def __call__(self, request):
         """Process request and log activity."""
+        from django_blackbox.activity_tracking import start_activity_context
+        
         config = get_conf()
         
         # Check if activity logging is enabled
@@ -176,6 +234,10 @@ class ActivityLoggingMiddleware(MiddlewareMixin):
         # Check sample rate
         if random.random() >= config.ACTIVITY_LOG_SAMPLE_RATE:
             return self.get_response(request)
+        
+        # NEW: start per-request activity tracking context
+        # This initializes the contextvars context that signal receivers will use
+        start_activity_context()
         
         # Record start time
         start_time = time.monotonic()
@@ -204,31 +266,100 @@ class ActivityLoggingMiddleware(MiddlewareMixin):
         """Log request activity to database."""
         config = get_conf()
         
-        # Calculate response time
-        response_time_ms = (time.monotonic() - start_time) * 1000
+        response_time_ms = self._get_response_time_ms(start_time)
+        request_id = self._get_request_id(request)
+        method, path, full_path, http_status = self._collect_basic_request_info(request, response)
+        view_name, route_name = self._resolve_view_info(request)
+        request_headers = self._collect_request_headers(request, config)
+        request_body = self._build_request_body(request, method, config)
+        response_headers = self._collect_response_headers(response, config)
+        response_body = self._build_response_body(response, config)
+        user, is_authenticated = self._resolve_user(request)
+        ip_address = extract_ip_address(request)
+        user_agent = extract_user_agent(request) or ""
+        incident = self._resolve_incident(request, request_id)
+        content_type, object_id = self._resolve_related_object(request)
         
-        # Get request ID
-        request_id = getattr(request, "django_blackbox_request_id", None) or get_request_id() or ""
+        # Get manual activity context (if app code explicitly set it)
+        activity_ctx = getattr(request, "_activity_change_context", None) or {}
+        explicit_action = activity_ctx.get("action")
+        custom_action = activity_ctx.get("custom_action", "")
+        custom_payload = activity_ctx.get("custom_payload", {})
+        instance_before = activity_ctx.get("instance_before", {})
+        instance_after = activity_ctx.get("instance_after", {})
+        instance_diff = activity_ctx.get("instance_diff", {})
         
-        # Collect basic request info
+        # NEW: overlay automatic tracked changes from signals
+        # This gets instance_before/after/diff from pre_save/post_save signals
+        from django_blackbox.activity_tracking import get_tracked_change_for
+        tracked_before, tracked_after, tracked_diff = get_tracked_change_for(content_type, object_id)
+        
+        # If manual context didn't set them, use tracked values from signals
+        if not instance_before and tracked_before:
+            instance_before = tracked_before
+        if not instance_after and tracked_after:
+            instance_after = tracked_after
+        if not instance_diff and tracked_diff:
+            instance_diff = tracked_diff
+        
+        # Resolve action and finalize change context
+        action, instance_before, instance_after, instance_diff, custom_action, custom_payload = \
+            self._resolve_action_and_change_context(
+                method,
+                object_id,
+                {
+                    "action": explicit_action,
+                    "custom_action": custom_action,
+                    "custom_payload": custom_payload,
+                    "instance_before": instance_before,
+                    "instance_after": instance_after,
+                    "instance_diff": instance_diff,
+                },
+            )
+        
+        self._create_request_activity(
+            method, path, full_path,
+            http_status, response_time_ms, view_name, route_name,
+            request_id, incident,
+            user, is_authenticated, ip_address, user_agent,
+            content_type, object_id,
+            request_headers, request_body,
+            response_headers, response_body,
+            action, instance_before, instance_after, instance_diff,
+            custom_action, custom_payload,
+            config,
+        )
+    
+    def _get_response_time_ms(self, start_time: float) -> float:
+        """Calculate response time in milliseconds."""
+        return (time.monotonic() - start_time) * 1000
+    
+    def _get_request_id(self, request: Any) -> str:
+        """Get request ID from request object or context."""
+        return getattr(request, "django_blackbox_request_id", None) or get_request_id() or ""
+    
+    def _collect_basic_request_info(self, request: Any, response: Any) -> tuple[str, str, str, int]:
+        """Collect basic request information."""
         method = request.method
         path = request.path
         query_string = request.META.get("QUERY_STRING", "")
         full_path = path
         if query_string:
             full_path = f"{path}?{query_string}"
-        
-        # Get HTTP status
         http_status = getattr(response, "status_code", 500) if response else 500
-        
-        # Extract view/route info
+        return method, path, full_path, http_status
+    
+    def _resolve_view_info(self, request: Any) -> tuple[str, str]:
+        """Resolve view name and route name from request."""
         view_name = ""
         route_name = ""
         if hasattr(request, "resolver_match") and request.resolver_match:
             view_name = getattr(request.resolver_match, "view_name", "") or ""
             route_name = getattr(request.resolver_match, "url_name", "") or ""
-        
-        # Collect headers (with redaction)
+        return view_name, route_name
+    
+    def _collect_request_headers(self, request: Any, config: Any) -> dict:
+        """Collect and redact request headers."""
         request_headers = {}
         for key, value in request.META.items():
             if key.startswith("HTTP_"):
@@ -238,9 +369,14 @@ class ActivityLoggingMiddleware(MiddlewareMixin):
         if config.REDACT_SENSITIVE_DATA:
             request_headers = redact_headers(request_headers, config.REDACT_HEADERS, config.REDACT_MASK)
         
-        # Collect request body (with redaction and truncation)
-        # Build unified request payload including query params and body data
+        return request_headers
+    
+    def _build_request_body(self, request: Any, method: str, config: Any) -> str:
+        """Build unified request body payload including query params and body data."""
+        import logging
         from django.http import QueryDict
+        
+        logger = logging.getLogger(__name__)
         
         request_payload = {}
         
@@ -262,19 +398,17 @@ class ActivityLoggingMiddleware(MiddlewareMixin):
         # 2. Collect parsed body data (DRF request.data or request.POST)
         body_data = None
         
-        # Try DRF request.data first                
-        if hasattr(request, "data"):            
+        # Try DRF request.data first
+        if hasattr(request, "data"):
             try:
                 data_attr = request.data
-                # Accept any non-None value (including empty dict/list for POST requests)
-                # Empty dict/list still indicates a parsed body was present
                 if data_attr is not None:
                     body_data = data_attr
-            except Exception as e:                
-                pass        
+            except Exception:
+                body_data = None
         
         # Fallback to request.POST if no DRF data
-        if body_data is None:            
+        if body_data is None:
             try:
                 post_qd = request.POST
                 if isinstance(post_qd, QueryDict) and post_qd:
@@ -285,29 +419,68 @@ class ActivityLoggingMiddleware(MiddlewareMixin):
             except Exception:
                 pass
         
-        # 3. Fallback to raw request.body if no parsed data
+        # 3. Use cached raw body from BodyCaptureMiddleware, NEVER call request.body here
+        content_type_raw = request.META.get("CONTENT_TYPE", "") or ""
+        content_type = content_type_raw.split(";")[0].strip().lower()
+        store_body_for_methods = method.upper() in ("POST", "PUT", "PATCH", "DELETE")
+        
+        # Ensure application/json is always allowed
+        store_body_types = set(config.STORE_BODY_CONTENT_TYPES)
+        if "application/json" not in store_body_types:
+            store_body_types.add("application/json")
+        
+        # Debug logging
+        logger.debug(
+            "Blackbox body debug: method=%s content_type=%s has_data_attr=%s",
+            method, content_type, hasattr(request, "data"),
+        )
+        logger.debug(
+            "Blackbox body debug: GET=%s POST=%s body_data=%s",
+            dict(request.GET), dict(request.POST), body_data is not None,
+        )
         raw_body_text = ""
-        if not body_data:
-            content_type_raw = request.META.get("CONTENT_TYPE", "")
-            content_type = content_type_raw.split(";")[0].strip().lower() if content_type_raw else ""
+        raw_body_cached = getattr(request, "_django_blackbox_raw_body", None)
+        
+        logger.debug(
+            "Blackbox body debug: method=%s content_type=%s has_data_attr=%s raw_body_cached=%s",
+            method, content_type, hasattr(request, "data"), raw_body_cached is not None,
+        )
+        
+        # Try to use cached raw body if:
+        # 1. We don't have parsed body data yet
+        # 2. It's a mutating method
+        # 3. We have a cached raw body
+        # 4. Content-type is in allowed types OR it's JSON (always allow JSON)
+        should_use_raw = (
+            body_data is None and
+            store_body_for_methods and
+            raw_body_cached is not None and
+            (content_type in store_body_types or "application/json" in content_type)
+        )
+        
+        if should_use_raw and isinstance(raw_body_cached, bytes) and raw_body_cached:
+            try:
+                # Debug: log raw body preview
+                logger.debug("Blackbox body raw cached preview: %r", raw_body_cached[:256])
+            except Exception:
+                pass
             
-            # Only try to read body for mutating methods
-            store_body_for_methods = method.upper() in ("POST", "PUT", "PATCH", "DELETE")
-            
-            if store_body_for_methods and content_type in config.STORE_BODY_CONTENT_TYPES:
+            # Try JSON first if content-type suggests it
+            if "application/json" in content_type:
                 try:
-                    raw_body = request.body
-                    if isinstance(raw_body, bytes) and raw_body:
-                        truncated = raw_body[:config.MAX_BODY_BYTES]
-                        raw_body_text = truncated.decode("utf-8", errors="replace")
-                except RawPostDataException:
-                    # Body already consumed by DRF/Django; skip logging it
-                    raw_body_text = ""
-                except Exception:
-                    raw_body_text = ""
+                    body_data = json.loads(raw_body_cached.decode("utf-8"))
+                    logger.debug("Blackbox body: Successfully parsed cached raw body as JSON")
+                except (json.JSONDecodeError, UnicodeDecodeError) as e:
+                    # Not valid JSON; fall back to raw text
+                    logger.debug("Blackbox body: JSON parse failed on cached body: %s", e)
+                    truncated = raw_body_cached[:config.MAX_BODY_BYTES]
+                    raw_body_text = truncated.decode("utf-8", errors="replace")
+            else:
+                # Not JSON content-type, store as raw text
+                truncated = raw_body_cached[:config.MAX_BODY_BYTES]
+                raw_body_text = truncated.decode("utf-8", errors="replace")
         
         # 4. Add body data or raw body to payload
-        # Include body_data even if it's an empty dict/list (indicates parsed body was present)
         if body_data is not None:
             request_payload["body"] = body_data
         elif raw_body_text:
@@ -323,20 +496,21 @@ class ActivityLoggingMiddleware(MiddlewareMixin):
                 request_payload["body"] = redacted_body
         
         # 6. Convert to JSON string
-        request_body = ""
-        if request_payload:
-            try:
-                request_body_text = json.dumps(request_payload, default=str, separators=(",", ":"), ensure_ascii=False)
-                # Truncate if needed
-                request_body_bytes = request_body_text.encode("utf-8")
-                if len(request_body_bytes) > config.MAX_BODY_BYTES:
-                    request_body = request_body_bytes[:config.MAX_BODY_BYTES].decode("utf-8", errors="replace") + "..."
-                else:
-                    request_body = request_body_text
-            except Exception:
-                request_body = ""
+        if not request_payload:
+            return ""
         
-        # Collect response headers
+        try:
+            text = json.dumps(request_payload, default=str, separators=(",", ":"), ensure_ascii=False)
+            data_bytes = text.encode("utf-8")
+            if len(data_bytes) > config.MAX_BODY_BYTES:
+                return data_bytes[:config.MAX_BODY_BYTES].decode("utf-8", errors="replace") + "..."
+            return text
+        except Exception as e:
+            logger.debug("Blackbox body: Exception serializing payload: %s", e)
+            return ""
+    
+    def _collect_response_headers(self, response: Any, config: Any) -> dict:
+        """Collect and redact response headers."""
         response_headers = {}
         if response:
             try:
@@ -357,15 +531,16 @@ class ActivityLoggingMiddleware(MiddlewareMixin):
         if config.REDACT_SENSITIVE_DATA:
             response_headers = redact_headers(response_headers, config.REDACT_HEADERS, config.REDACT_MASK)
         
-        # Collect response body
-        # Default to True unless explicitly disabled (changed from False to True)
+        return response_headers
+    
+    def _build_response_body(self, response: Any, config: Any) -> str:
+        """Build response body string."""
         store_response_body = getattr(config, "STORE_RESPONSE_BODY", True)
         response_body = ""
         
         if store_response_body and response:
             try:
-                # Try DRF Response first (has .data attribute)
-                # Check if it's a DRF Response by checking for .data attribute and type
+                # Try DRF Response first
                 try:
                     from rest_framework.response import Response as DRFResponse
                 except ImportError:
@@ -396,7 +571,7 @@ class ActivityLoggingMiddleware(MiddlewareMixin):
                         except Exception:
                             response_body = ""
                 
-                # Fallback: use response.content if DRF data didn't work or not DRF response
+                # Fallback: use response.content if DRF data didn't work
                 if not response_body and hasattr(response, "content"):
                     try:
                         raw_content = response.content
@@ -406,105 +581,168 @@ class ActivityLoggingMiddleware(MiddlewareMixin):
                     except Exception:
                         response_body = ""
             except Exception:
-                # Silently skip if we can't parse response body
                 response_body = ""
         
-        # Get user info
+        return response_body
+    
+    def _resolve_user(self, request: Any) -> tuple[Any, bool]:
+        """Resolve user from request."""
         user = None
         is_authenticated = False
         if hasattr(request, "user") and request.user.is_authenticated:
             user = request.user
             is_authenticated = True
-        
-        # Get IP and user agent
-        ip_address = extract_ip_address(request)
-        user_agent = extract_user_agent(request) or ""
-        
-        # Link to incident if one was created
+        return user, is_authenticated
+    
+    def _resolve_incident(self, request: Any, request_id: str) -> Any:
+        """Resolve linked incident if one was created."""
         incident = None
         if hasattr(request, "_django_blackbox_incident_created") and request._django_blackbox_incident_created:
-            # Try to find the incident by request_id
-            # Note: Incident.request_id is UUIDField, so we need to convert string to UUID
             try:
                 import uuid
                 request_id_uuid = uuid.UUID(request_id) if request_id else None
                 if request_id_uuid:
                     incident = Incident.objects.filter(request_id=request_id_uuid).order_by("-occurred_at").first()
             except (ValueError, TypeError, AttributeError):
-                # request_id might not be a valid UUID, skip linking
                 pass
+        return incident
+    
+    def _resolve_related_object(self, request: Any) -> tuple[Any, str]:
+        """
+        Resolve related object (Generic FK) from request.
         
-        # Try to determine related object (Generic FK)
+        Uses resolver_match + DRF's router semantics to find the view class and view instance,
+        then resolves the model and object_id from URL kwargs.
+        
+        Returns:
+            (content_type, object_id)
+        """
+        import logging
+        
+        logger = logging.getLogger(__name__)
+        
         content_type = None
         object_id = ""
-        if hasattr(request, "resolver_match") and request.resolver_match:
-            try:
-                # For DRF ViewSets
-                if hasattr(request, "parser_context") and request.parser_context:
-                    view = request.parser_context.get("view")
-                    if view and hasattr(view, "get_queryset"):
-                        try:
-                            queryset = view.get_queryset()
-                            if queryset and hasattr(queryset, "model"):
-                                model = queryset.model
-                                lookup_field = getattr(view, "lookup_field", "pk")
-                                lookup_url_kwarg = getattr(view, "lookup_url_kwarg", lookup_field)
-                                
-                                if lookup_url_kwarg in request.resolver_match.kwargs:
-                                    lookup_value = request.resolver_match.kwargs[lookup_url_kwarg]
-                                    content_type = ContentType.objects.get_for_model(model)
-                                    object_id = str(lookup_value)
-                        except Exception:
-                            pass
+        
+        match = getattr(request, "resolver_match", None)
+        if not match:
+            return content_type, object_id
+        
+        # Debug (keep it for now)
+        logger.debug(
+            "Blackbox related object: path=%s view_name=%s func=%r kwargs=%r",
+            getattr(request, "path", ""),
+            getattr(match, "view_name", ""),
+            getattr(match, "func", None),
+            getattr(match, "kwargs", {}),
+        )
+        
+        try:
+            # 1. Resolve view_class
+            func = match.func
+            view_class = None
+            
+            if hasattr(func, "cls"):
+                # DRF ViewSet registered via router
+                view_class = func.cls
+            elif hasattr(func, "view_class"):
+                # Django CBV
+                view_class = func.view_class
+            
+            # 2. Resolve view_instance (DRF request)
+            view_instance = None
+            if hasattr(request, "parser_context") and request.parser_context:
+                view_instance = request.parser_context.get("view")
+            
+            # 3. Resolve model
+            model = None
+            
+            # 3a. DRF view instance queryset / serializer
+            if view_instance is not None:
+                qs = getattr(view_instance, "queryset", None)
+                if qs is not None and hasattr(qs, "model"):
+                    model = qs.model
                 
-                # Fallback: try to get from kwargs (for Django CBVs)
-                if not content_type and request.resolver_match.kwargs:
-                    # Look for common keys like 'pk', 'id'
+                if model is None and hasattr(view_instance, "get_queryset"):
+                    try:
+                        qs = view_instance.get_queryset()
+                        if qs is not None and hasattr(qs, "model"):
+                            model = qs.model
+                    except Exception:
+                        pass
+                
+                # Try serializer.Meta.model
+                if model is None and hasattr(view_instance, "get_serializer_class"):
+                    try:
+                        serializer_class = view_instance.get_serializer_class()
+                        meta = getattr(serializer_class, "Meta", None)
+                        model = getattr(meta, "model", None)
+                    except Exception:
+                        pass
+            
+            # 3b. View class-level queryset / model (for DRF generics & CBVs)
+            if model is None and view_class is not None:
+                qs = getattr(view_class, "queryset", None)
+                if qs is not None and hasattr(qs, "model"):
+                    model = qs.model
+                
+                if model is None and hasattr(view_class, "model"):
+                    model = view_class.model
+            
+            # 4. Resolve object_id from URL kwargs
+            kwargs = match.kwargs or {}
+            if kwargs:
+                # DRF semantics if view_instance exists
+                if view_instance is not None:
+                    lookup_field = getattr(view_instance, "lookup_field", "pk")
+                    lookup_url_kwarg = getattr(view_instance, "lookup_url_kwarg", lookup_field)
+                    
+                    if lookup_url_kwarg in kwargs:
+                        object_id = str(kwargs[lookup_url_kwarg])
+                
+                # Fallback to common patterns
+                if not object_id:
                     for key in ["pk", "id", "object_id"]:
-                        if key in request.resolver_match.kwargs:
-                            object_id = str(request.resolver_match.kwargs[key])
-                            # Try to infer model from view class
-                            if hasattr(request.resolver_match, "func") and hasattr(request.resolver_match.func, "view_class"):
-                                view_class = request.resolver_match.func.view_class
-                                if hasattr(view_class, "model"):
-                                    try:
-                                        content_type = ContentType.objects.get_for_model(view_class.model)
-                                    except Exception:
-                                        pass
+                        if key in kwargs:
+                            object_id = str(kwargs[key])
                             break
-            except Exception:
-                # Best-effort, never fail
-                pass
+            
+            # 5. Build content_type if model is found
+            if model is not None:
+                try:
+                    content_type = ContentType.objects.get_for_model(model)
+                except Exception:
+                    content_type = None
+        except Exception:
+            # Best-effort: never raise
+            logger.debug("Failed to resolve related object", exc_info=True)
         
-        # Get activity change context if set by helper/decorator
-        activity_ctx = getattr(request, "_activity_change_context", None) or {}
-        # Get explicit_action - it may be None (not set), "" (explicitly empty), or a string
-        explicit_action = activity_ctx.get("action") if activity_ctx else None
-        custom_action = activity_ctx.get("custom_action", "") if activity_ctx else ""
-        custom_payload = activity_ctx.get("custom_payload", {}) if activity_ctx else {}
-        instance_before = activity_ctx.get("instance_before", {}) if activity_ctx else {}
-        instance_after = activity_ctx.get("instance_after", {}) if activity_ctx else {}
-        instance_diff = activity_ctx.get("instance_diff", {}) if activity_ctx else {}
+        return content_type, object_id
+    
+    def _resolve_action_and_change_context(
+        self, method: str, object_id: str, activity_ctx: dict
+    ) -> tuple[str, dict, dict, dict, str, dict]:
+        """Resolve action and instance change context."""
+        explicit_action = activity_ctx.get("action")
+        custom_action = activity_ctx.get("custom_action", "")
+        custom_payload = activity_ctx.get("custom_payload", {})
+        instance_before = activity_ctx.get("instance_before", {})
+        instance_after = activity_ctx.get("instance_after", {})
+        instance_diff = activity_ctx.get("instance_diff", {})
         
-        # Compute action based on HTTP method if not explicitly set
         method_upper = method.upper() if method else ""
         
         if explicit_action is not None and explicit_action != "":
-            # Use explicit action from helper/decorator (non-empty string)
             action = explicit_action
         elif custom_action and (explicit_action is None or explicit_action == ""):
-            # If custom_action is set but no explicit action (or explicit action is empty), use "CUSTOM"
             action = "CUSTOM"
         else:
             # Default action mapping based on HTTP method
             if method_upper == "GET":
                 action = "VIEW"
             elif method_upper == "POST":
-                # POST can be CREATE or UPDATE
-                # If we have object_id/content_type (detail view) or instance_before (change tracking),
-                # treat it as UPDATE
-                has_object_context = bool(object_id)  # object_id is set from URL params
-                has_instance_before = bool(instance_before)  # instance_before is a dict from helper
+                has_object_context = bool(object_id)
+                has_instance_before = bool(instance_before)
                 if has_object_context or has_instance_before:
                     action = "UPDATE"
                 else:
@@ -514,12 +752,33 @@ class ActivityLoggingMiddleware(MiddlewareMixin):
             elif method_upper == "DELETE":
                 action = "DELETE"
             else:
-                # For other methods (HEAD, OPTIONS, etc.), use the method name
                 action = method_upper or ""
         
-        # Create RequestActivity
+        return action, instance_before, instance_after, instance_diff, custom_action, custom_payload
+    
+    def _create_request_activity(
+        self,
+        method: str, path: str, full_path: str,
+        http_status: int, response_time_ms: float, view_name: str, route_name: str,
+        request_id: str, incident: Any,
+        user: Any, is_authenticated: bool, ip_address: Any, user_agent: str,
+        content_type: Any, object_id: str,
+        request_headers: dict, request_body: str,
+        response_headers: dict, response_body: str,
+        action: str, instance_before: dict, instance_after: dict, instance_diff: dict,
+        custom_action: str, custom_payload: dict,
+        config: Any,
+    ) -> None:
+        """Create RequestActivity record in database."""
         try:
-            activity = RequestActivity.objects.create(
+            # Sanitize JSON fields to ensure all values are JSON-serializable
+            # This converts UUID, datetime, Decimal, etc. to strings
+            instance_before = sanitize_for_json(instance_before)
+            instance_after = sanitize_for_json(instance_after)
+            instance_diff = sanitize_for_json(instance_diff)
+            custom_payload = sanitize_for_json(custom_payload)
+            
+            RequestActivity.objects.create(
                 method=method,
                 path=path,
                 full_path=full_path,

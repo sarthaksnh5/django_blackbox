@@ -1,12 +1,15 @@
 """
 Utility functions for redaction, hashing, metadata collection, and fallback logging.
 """
+import datetime
+import decimal
 import hashlib
 import json
 import logging
 import re
 import traceback
-from datetime import datetime, timedelta
+import uuid
+from datetime import timedelta
 from ipaddress import ip_address
 from typing import Any
 
@@ -385,3 +388,40 @@ def safe_log_to_file(data: dict[str, Any]) -> None:
             f.write(json.dumps(log_entry, ensure_ascii=False) + "\n")
     except Exception as e:
         logger.error(f"Failed to write to fallback log file: {e}")
+
+
+def sanitize_for_json(value: Any) -> Any:
+    """
+    Recursively convert Python objects into JSON-serializable structures.
+    
+    - Keeps primitives (str, int, float, bool, None) as-is.
+    - Recursively processes dict, list, tuple, set.
+    - Converts UUID, datetime, date, Decimal, and other unknown objects to str().
+    
+    Args:
+        value: Any Python value to sanitize.
+        
+    Returns:
+        JSON-serializable value (str, int, float, bool, None, dict, list).
+    """
+    # Primitives
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    
+    # UUID / Decimal / datetime-like → string
+    if isinstance(value, (uuid.UUID, decimal.Decimal, datetime.datetime, datetime.date, datetime.time, timedelta)):
+        return str(value)
+    
+    # dict → dict
+    if isinstance(value, dict):
+        return {sanitize_for_json(k): sanitize_for_json(v) for k, v in value.items()}
+    
+    # list / tuple / set → list
+    if isinstance(value, (list, tuple, set)):
+        return [sanitize_for_json(v) for v in value]
+    
+    # Fallback: best-effort string
+    try:
+        return str(value)
+    except Exception:
+        return repr(value)
