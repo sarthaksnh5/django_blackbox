@@ -6,6 +6,7 @@ import traceback
 import uuid
 from typing import Any
 
+from django.db import IntegrityError
 from django.http import JsonResponse
 from django.utils import timezone
 
@@ -139,14 +140,14 @@ def safe_persist_incident(
     except (ValueError, TypeError):
         request_id = uuid.uuid4()
     
-    # Generate incident ID
+    # incident_id is generated inside create_or_increment when creating (to avoid races)
     incident_id = Incident.generate_incident_id()
-    
+
     # If no stacktrace but we have an exception message that looks like a stacktrace,
     # make sure it's stored in the stacktrace field
     if not stacktrace and exception_message and len(exception_message) > 200 and "Traceback" in exception_message:
         stacktrace = exception_message
-    
+
     # Prepare defaults for create_or_increment
     defaults = {
         "request_id": request_id,
@@ -172,12 +173,20 @@ def safe_persist_incident(
     }
     
     try:
-        incident, created = Incident.objects.create_or_increment(
-            signature=dedup_hash,
-            defaults=defaults,
-            window_seconds=config.DEDUP_WINDOW_SECONDS,
-        )
-        return incident
+        max_attempts = 3
+        for attempt in range(max_attempts):
+            try:
+                incident, created = Incident.objects.create_or_increment(
+                    signature=dedup_hash,
+                    defaults=defaults,
+                    window_seconds=config.DEDUP_WINDOW_SECONDS,
+                )
+                return incident
+            except IntegrityError as e:
+                # Duplicate incident_id (race): retry; manager generates id inside transaction
+                if "incident_id" in str(e) and attempt < max_attempts - 1:
+                    continue
+                raise
     except Exception as e:
         # Fallback logging
         import logging

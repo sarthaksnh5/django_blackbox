@@ -48,7 +48,7 @@ class Migration(migrations.Migration):
             options={
                 'ordering': ['-occurred_at'],
                 'indexes': [models.Index(fields=['-occurred_at'], name='django_blac_occurre_95b060_idx'), models.Index(fields=['dedup_hash'], name='django_blac_dedup_h_633a2b_idx'), models.Index(fields=['status', '-occurred_at'], name='django_blac_status_a765ad_idx')],
-                'constraints': [models.CheckConstraint(condition=models.Q(('status__in', ['OPEN', 'ACKNOWLEDGED', 'RESOLVED', 'SUPPRESSED'])), name='valid_status')],
+                # 'constraints': [models.CheckConstraint(condition=models.Q(('status__in', ['OPEN', 'ACKNOWLEDGED', 'RESOLVED', 'SUPPRESSED'])), name='valid_status')],
             },
         ),
         migrations.CreateModel(

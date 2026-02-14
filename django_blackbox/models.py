@@ -63,7 +63,20 @@ class IncidentManager(models.Manager):
                 existing.save(update_fields=["occurrence_count", "occurred_at", "exception_message", "path", "ip_address"])
                 return existing, False
             else:
-                # Create new incident
+                # Create new incident: generate incident_id inside transaction with lock
+                # to avoid race where two workers both get the same "next" id.
+                defaults = dict(defaults)
+                last = self.filter(
+                    incident_id__startswith="INCIDENT-"
+                ).order_by("-incident_id").select_for_update().first()
+                if last:
+                    try:
+                        next_num = int(last.incident_id.split("-")[1]) + 1
+                    except (ValueError, IndexError):
+                        next_num = 1
+                else:
+                    next_num = 1
+                defaults["incident_id"] = f"INCIDENT-{next_num:04d}"
                 incident = self.create(**defaults)
                 return incident, True
 
